@@ -2185,6 +2185,101 @@ defmodule AxonOnnx.Deserialize do
     {updated_axon, params, used_params}
   end
 
+  defp recur_nodes(
+         %Node{op_type: "ConvTranspose", attribute: attrs, input: input, output: [output_name]},
+         {axon, params, used_params}
+       ) do
+    conv_transpose_options = options!(attrs)
+
+    kernel_shape_options = conv_transpose_options["kernel_shape"]
+    auto_pad = conv_transpose_options["auto_pad"] || "NOTSET"
+    dilations = conv_transpose_options["dilations"] || 1
+    group = conv_transpose_options["group"] || 1
+    pads = conv_transpose_options["pads"]
+    strides = conv_transpose_options["strides"]
+
+    [inp_name, kernel_name | maybe_bias] = input
+
+    inp = input!(inp_name, axon, params, used_params)
+    kernel = input!(kernel_name, axon, params, used_params)
+
+    kernel = Nx.transpose(kernel, axes: [1, 0, 2, 3])
+
+    bias =
+      case maybe_bias do
+        [] ->
+          nil
+
+        [bias_name] ->
+          input!(bias_name, axon, params, used_params)
+      end
+
+    kernel_shape = Nx.shape(kernel)
+
+    kernel_size =
+      if kernel_shape_options do
+        List.to_tuple(kernel_shape_options)
+      else
+        Nx.shape(kernel)
+        |> Tuple.delete_at(0)
+        |> Tuple.delete_at(0)
+      end
+
+    padding_config = padding!(auto_pad, pads, kernel_size, strides)
+
+    units = elem(kernel_shape, 0)
+
+    {updated_axon, updated_params} =
+      case {get_axon_node(inp), get_axon_node(kernel), get_axon_node(bias)} do
+        {%Axon.Node{}, %Nx.Tensor{} = kernel, %Nx.Tensor{} = bias} ->
+          cond do
+            padding_config == [{0, 0}, {0, 0}] ->
+              out_layer =
+                Axon.conv_transpose(
+                  inp,
+                  units,
+                  kernel_size: kernel_size,
+                  kernel_dilation: dilations,
+                  strides: strides,
+                  use_bias: true,
+                  name: output_name,
+                  channels: :first,
+                  padding: :valid
+                )
+
+              updated_axon = Map.put(axon, output_name, out_layer)
+
+              updated_params =
+                Map.put(used_params, output_name, %{"kernel" => kernel, "bias" => bias})
+
+              {updated_axon, updated_params}
+
+            true ->
+              out_layer =
+                Axon.conv_transpose(
+                  inp,
+                  units,
+                  kernel_size: kernel_size,
+                  kernel_dilation: dilations,
+                  padding: :same,
+                  strides: strides,
+                  use_bias: true,
+                  name: output_name,
+                  channels: :first
+                )
+
+              updated_axon = Map.put(axon, output_name, out_layer)
+
+              updated_params =
+                Map.put(used_params, output_name, %{"kernel" => kernel, "bias" => bias})
+
+              {updated_axon, updated_params}
+          end
+      end
+
+    {updated_axon, params, updated_params}
+  end
+
   defp recur_nodes(%Node{op_type: unsupported}, _) do
     raise ArgumentError, "unsupported #{inspect(unsupported)}"
   end
